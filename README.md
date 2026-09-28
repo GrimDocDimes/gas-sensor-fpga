@@ -1,175 +1,105 @@
-# Breath-Based Gas Sensing System
-## Nexys 4 DDR / Artix-7 XC7A100T — XADC Resistive Gas Sensor
+# Multi-Channel Resistive Gas Sensor Acquisition FPGA System
+
+## Overview
+
+This repository contains FPGA implementations for resistive MOx gas sensor array acquisition systems, targeted primarily at the **PYNQ-Z2 (Zynq-7000 XC7Z020)** PL/PS architecture with support for legacy Artix-7 board scaffolds.
 
 ---
 
-## Quick Overview
+## Primary Project: PYNQ-Z2 6-Channel Multi-Resistive Sensor Acquisition System
 
-A real-time gas sensing system that reads a 2-pin MOx resistive analog gas sensor
-through the Nexys 4 DDR's on-chip XADC, computes deviation from a clean-air baseline,
-and displays the result on the 7-segment display while streaming data over UART.
+A 6-channel resistive gas sensor array signal acquisition, baseline tracking, rate-of-change (dR/dt) detection, cross-channel fault verification, and alarm controller system.
+
+### Architecture Overview
+- **Device**: Xilinx Zynq-7000 (xc7z020clg400-1) on PYNQ-Z2
+- **Input Channels**: 6 Single-Ended Analog Channels (A0–A5 / VAUX1, VAUX9, VAUX6, VAUX15, VAUX5, VAUX13)
+- **Clock Domain**: 50 MHz PL Clock (`clk`)
+- **System Interface**: AXI4-Lite Slave (`s_axi_aclk`, Base `0x43C0_0000`)
+- **Alarm Output**: On-board LED `LD0` driven by registered Moore FSM with priority handling
 
 ```
-[Gas Sensor + Voltage Dividers] --0-1V--> [XADC VAUXP/N] --12-bit--> [Baseline+Delta RTL]
-                                                                               |
-                                                    +--------------------------+---------------------------+
-                                                    |                                                       |
-                                            [7-Seg Display (8 digits)]                          [UART TX → USB-CDC]
-                                                    |                                                       |
-                                             (sensitivity % or ΔR)                                  (ASCII CSV frames)
-                                                                                                            |
-                                                                                                      [PC Logger]
+   ┌────────────────┐
+   │ 6× Gas Sensors │
+   └───────┬────────┘
+           │ (Analog 0..1.3391V)
+           ▼
+   ┌────────────────┐     DRP     ┌─────────────────┐
+   │ XADC Wizard IP │ ──────────► │ xadc_sequencer  │
+   └────────────────┘             └────────┬────────┘
+                                           │ (12-bit ADC code)
+                                           ▼
+                                  ┌─────────────────┐
+                                  │ resistance_calc │
+                                  └────────┬────────┘
+                                           │ (32-bit Resistance Ω)
+                  ┌────────────────────────┼────────────────────────┐
+                  ▼                        ▼                        ▼
+        ┌──────────────────┐     ┌──────────────────┐    ┌─────────────────────┐
+        │ baseline_tracker │     │   roc_detector   │    │ cross_channel_fault │
+        └──────────────────┘     └────────┬─────────┘    └──────────┬──────────┘
+                                          │                         │
+                                          ▼                         ▼
+                                 ┌────────────────────────────────────┐
+                                 │          alarm_controller          │
+                                 └─────────────────┬──────────────────┘
+                                                   │
+                                                   ▼
+                                         LED LD0 / AXI-Lite Regs
 ```
+
+### RTL Modules (`rtl/`)
+| Module | Description |
+|---|---|
+| [`gas_sensor_top.v`](file:///home/jhush/testurop/rtl/gas_sensor_top.v) | Top-level integration connecting XADC sequencer, processing chain, alarm controller, and AXI-Lite registers |
+| [`div_pipe.v`](file:///home/jhush/testurop/rtl/div_pipe.v) | Fully sequential restoring pipelined/iterative divider (27-cycle exact division) |
+| [`resistance_calc.v`](file:///home/jhush/testurop/rtl/resistance_calc.v) | Fixed-point voltage-to-resistance calculator with over-range / under-range flags |
+| [`baseline_tracker.v`](file:///home/jhush/testurop/rtl/baseline_tracker.v) | Exponential moving average (EMA, $\alpha=1/2^N$) baseline tracker per channel |
+| [`roc_detector.v`](file:///home/jhush/testurop/rtl/roc_detector.v) | Rate-of-change ($|R[n] - R[n-1]| > \text{ROC\_THRESH}$) alarm detector per channel |
+| [`cross_channel_fault.v`](file:///home/jhush/testurop/rtl/cross_channel_fault.v) | Exact mean deviation detector distinguishing global gas exposures from single-sensor faults |
+| [`alarm_controller.v`](file:///home/jhush/testurop/rtl/alarm_controller.v) | Glitch-free Moore FSM alarm aggregator with sticky latch & PS acknowledgement |
+| [`axi_lite_regs.v`](file:///home/jhush/testurop/rtl/axi_lite_regs.v) | AXI4-Lite slave register file exposing live raw code, resistance, baseline, status & thresholds |
+| [`xadc_sequencer.v`](file:///home/jhush/testurop/rtl/xadc_sequencer.v) | DRP read FSM for XADC Wizard IP sequence polling |
 
 ---
 
-## Hardware Requirements
+## Verification & Simulation (`sim/`)
 
-| Item | Notes |
-|------|-------|
-| Nexys 4 DDR (or Nexys A7-100T) | Artix-7 XC7A100T |
-| 2-pin resistive MOx gas sensor | e.g. MQ-2, MQ-7, TGS-series |
-| 10 kΩ resistor (1%) | Load resistor |
-| Scaling resistor pair (TBD) | Set divider ratio after measuring sensor R-range |
-| Breadboard + jumper wires | |
-| USB-A to micro-B cable | Programming + UART |
-| 5V supply (can use USB 5V rail or external) | Sensor power |
-| Multimeter | **Required** before connecting sensor to FPGA |
+All RTL modules are thoroughly verified using self-checking Icarus Verilog (`iverilog`) testbenches.
 
----
-
-## Critical Safety Step — Read Before Connecting Anything
-
-> The JXADC analog inputs are rated **0–1 V maximum**.
-> Connecting more than 1 V will permanently damage the XADC input cell.
-
-**Mandatory pre-connection checklist:**
-1. Build sensor + 10kΩ + scaling divider on breadboard.
-2. Power with 5 V, measure `V_out1` (junction of sensor and 10kΩ) in clean air and under breath.
-3. Measure `V_out2` (output of scaling divider). It **must** stay below 0.9 V under all conditions.
-4. Only after multimeter-confirming step 3, connect to JXADC.
-
----
-
-## Analog Front-End
-
-```
-5V ──[Gas Sensor Rs]──┬──[R_load = 10kΩ]── GND
-                      │
-                    V_out1  (0–5V range, depends on Rs)
-                      │
-              ┌────[Ra]────┬── GND
-              │            │
-              │          V_out2  (0–1V, sized by Ra/Rb ratio)
-              └────────────┘
-                    [Rb]
-```
-
-**Divider math:**
-
-```
-V_out1 = 5V × (R_load / (Rs + R_load))
-V_out2 = V_out1 × (Rb / (Ra + Rb))
-
-Choose Ra, Rb so that V_out2_max ≈ 0.8V
-i.e. Rb/(Ra+Rb) ≈ 0.8 / V_out1_max
-```
-
-After measuring V_out1 range, compute Ra and Rb using standard E24 values.
-
----
-
-## JXADC Wiring (Nexys 4 DDR)
-
-Default configuration uses **VAUXP[6] / VAUXN[6]** → JXADC header pins JA1 / JA7.
-
-| JXADC Pin | Signal | Connect to |
-|-----------|--------|------------|
-| JA1 (pin 1) | VAUXP6 | V_out2 (scaled analog) |
-| JA7 (pin 7) | VAUXN6 | GND (analog reference) |
-| GND | Board GND | Circuit GND |
-
-> Verify pin mapping in the Nexys 4 DDR Reference Manual, Table 15 before connecting.
-
----
-
-## Building
-
-### Prerequisites
-- Vivado 2023.x (or later) with Artix-7 device support
-- Python 3.x with `pyserial`, `pandas`, `matplotlib` (for PC scripts)
-
-### Create Vivado Project
-```tcl
-# In Vivado Tcl Console:
-source fpga/scripts/create_project.tcl
-```
-
-### Program Board
-```tcl
-source fpga/scripts/program.tcl
-```
-
----
-
-## Board Controls
-
-| Control | Function |
-|---------|----------|
-| `CPU_RESETN` (active-low) | System reset |
-| `BTNC` (center button) | Capture baseline (clean-air reference) |
-| `SW[0]` | Display mode: 0 = sensitivity %, 1 = raw ΔR code |
-| `LED16_R` | Red = sensor warming up (3 min timer) |
-| `LED16_G` | Green = warm-up done, ready to baseline |
-| `LED[7:0]` | Bar graph of raw ADC code |
-
----
-
-## UART Data Format
-
-Baud rate: **115200, 8N1**
-
-Each frame (sent every 100 ms by default):
-```
-NNNNNN,RGAS,RAIR,DDDD,SSSS\r\n
-  │      │    │    │    └── Sensitivity × 100 (signed integer, e.g. -1234 = -12.34%)
-  │      │    │    └─────── Delta (R_gas - R_air, signed)
-  │      │    └──────────── Baseline ADC code (12-bit, 0-4095)
-  │      └───────────────── Live ADC code (12-bit, 0-4095)
-  └──────────────────────── Sample counter (wraps at 999999)
-```
-
----
-
-## PC Logging
-
+### Run All Testbenches
 ```bash
-# Live logging to CSV:
-python3 pc/gas_logger.py --port /dev/ttyUSB1 --output gas_log.csv
+cd sim
+bash run_sims.sh
+```
 
-# Offline plot:
-python3 pc/plot_sensitivity.py --input gas_log.csv
+### Verification Suite Results
+- `tb_resistance_calc.v` — **16/16 PASS**
+- `tb_alarm_controller.v` — **9/9 PASS**
+- `tb_baseline_tracker.v` — **5/5 PASS**
+- `tb_roc_detector.v` — **5/5 PASS**
+- `tb_cross_channel_fault.v` — **3/3 PASS**
+- `tb_axi_lite_regs.v` — **5/5 PASS**
+
+---
+
+## Repository Structure
+
+```
+├── constraints/
+│   └── pynqz2_gas_sensor.xdc    # PYNQ-Z2 XDC constraints (A0-A5, LED LD0)
+├── docs/
+│   └── design_spec.md           # Full FPGA Engineering Design Specification
+├── rtl/                         # Synthesizable Verilog-2001 RTL sources
+├── sim/                         # Self-checking testbenches and bash run script
+├── testpython/                  # Calibration notebook and Python test scripts
+│   ├── read_a0.ipynb            # Jupyter calibration notebook (V_FS = 1.3391V)
+│   └── read_a0.py               # Live Python acquisition script
+└── fpga/ & pc/                  # Legacy Nexys-4 DDR single-channel scaffold
 ```
 
 ---
 
-## Directory Structure
+## Documentation & Calibration
 
-```
-fpga/
-  src/                     # Verilog RTL source files
-  constraints/             # XDC pin/timing constraints
-  sim/                     # Testbenches
-  scripts/                 # Vivado TCL scripts
-pc/
-  gas_logger.py            # pyserial real-time logger
-  plot_sensitivity.py      # Matplotlib offline analysis
-```
-
----
-
-## Sensor Warm-Up Note
-
-MOx-type resistive gas sensors require **3–5 minutes** to stabilize after power-on.
-Wait for `LED16_G` to turn green before pressing `BTNC` to capture a clean-air baseline.
-Taking a baseline before warm-up will result in a drifting reference.
+- Complete design specification available at [`docs/design_spec.md`](file:///home/jhush/testurop/docs/design_spec.md).
+- Electrode calibration details in [`testpython/read_a0.ipynb`](file:///home/jhush/testurop/testpython/read_a0.ipynb).

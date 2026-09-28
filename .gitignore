@@ -1,17 +1,17 @@
-# Vivado project files
-fpga/vivado_project/
+# Simulation build artifacts
+build/
+sim/build/
+*.vvp
+*.vcd
+*.log
+
+# Byte-compiled / Python / Jupyter temp files
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Vivado / Xilinx build artifacts
 *.jou
 *.log
 .Xil/
-
-# LaTeX temp files
-*.aux
-*.toc
-*.out
-*.synctex.gz
-*.vcd
-
-# Python local runs
-*.csv
-__pycache__/
-*.pyc
+xsim.dir/
